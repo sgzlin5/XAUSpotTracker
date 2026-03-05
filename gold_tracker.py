@@ -186,14 +186,15 @@ class GoldTrackerApp:
         self.root = tk.Tk()
 
         # ── Window state ──
-        self._expanded    = False
-        self._drag_x      = 0
-        self._drag_y      = 0
-        self._flash_alpha = 0.0    # 1.0 → 0.0 fades over ~500 ms
-        self._flash_up    = True
-        self._status_angle = 0     # 0-359, drives pulsing dot animation
-        self._fetching    = False
-        self._running     = True
+        self._expanded      = False
+        self._taskbar_mode  = False   # True = OS title bar + shown in taskbar
+        self._drag_x        = 0
+        self._drag_y        = 0
+        self._flash_alpha   = 0.0    # 1.0 → 0.0 fades over ~500 ms
+        self._flash_up      = True
+        self._status_angle  = 0     # 0-359, drives pulsing dot animation
+        self._fetching      = False
+        self._running       = True
 
         # ── Data ──
         self.service      = GoldPriceService()
@@ -328,10 +329,15 @@ class GoldTrackerApp:
         menu.add_command(label="透明度  80%",  command=lambda: r.attributes("-alpha", 0.80))
         menu.add_command(label="透明度  60%",  command=lambda: r.attributes("-alpha", 0.60))
         menu.add_separator()
+        menu.add_command(label="切换到任务栏模式", command=self._toggle_taskbar_mode)
+        menu.add_separator()
         menu.add_command(label="重置到右上角",   command=self._reset_position)
         menu.add_separator()
         menu.add_command(label="退出",           command=self._quit)
         self._menu = menu
+        # Index of the taskbar-toggle entry (0-based, separators count)
+        # 展开/折叠(0) sep(1) 95%(2) 80%(3) 60%(4) sep(5) 切换任务栏(6)
+        self._menu_taskbar_idx = 6
 
         # Bind drag + right-click to all visible widgets
         _drag_widgets = (
@@ -356,6 +362,31 @@ class GoldTrackerApp:
 
     def _on_drag_move(self, e):
         self.root.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
+
+    # ──────────────────────────── Taskbar mode toggle ──────────────────────────
+
+    def _toggle_taskbar_mode(self):
+        """Switch between borderless floating window and normal OS-decorated window.
+        The OS-decorated window shows in the Windows taskbar.
+        """
+        self._taskbar_mode = not self._taskbar_mode
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+
+        # Must withdraw before changing overrideredirect on Windows
+        self.root.withdraw()
+
+        if self._taskbar_mode:
+            self.root.overrideredirect(False)
+            self.root.title("GoldTracker  |  XAU/USD")
+            self._menu.entryconfig(self._menu_taskbar_idx, label="切换到浮动模式")
+        else:
+            self.root.overrideredirect(True)
+            self._menu.entryconfig(self._menu_taskbar_idx, label="切换到任务栏模式")
+
+        self.root.geometry(f"+{x}+{y}")
+        self.root.deiconify()
+        # Re-apply topmost (overrideredirect reset can clear it on some systems)
+        self.root.attributes("-topmost", True)
 
     # ──────────────────────────── Expand / Collapse ───────────────────────────
 
@@ -433,8 +464,14 @@ class GoldTrackerApp:
                 text=f"${price:,.2f}",
                 fg=color,
             )
+            # In taskbar mode keep titlebar in sync so it shows in the taskbar
+            if self._taskbar_mode:
+                sign = "+" if chg >= 0 else ""
+                self.root.title(f"XAU/USD  ${price:,.2f}  {sign}{chg:.2f} ({sign}{pct:.3f}%)")
         else:
             self._lbl_price.config(text="Connecting…", fg=C_DIM)
+            if self._taskbar_mode:
+                self.root.title("GoldTracker  |  XAU/USD  Connecting…")
 
         # ── Status dot ───────────────────────────────────────────────────
         if self._fetching:
