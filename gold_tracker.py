@@ -372,15 +372,18 @@ class GoldTrackerApp:
         self._taskbar_mode = not self._taskbar_mode
         x, y = self.root.winfo_x(), self.root.winfo_y()
 
-        # Must withdraw before changing overrideredirect on Windows
+        # Must withdraw before changing overrideredirect on Windows.
+        # Use tk.call directly to avoid a tkinter bug on Windows where
+        # overrideredirect(bool) tries to parse the return value as boolean
+        # but gets an empty string, raising TclError.
         self.root.withdraw()
 
         if self._taskbar_mode:
-            self.root.overrideredirect(False)
+            self.root.tk.call('wm', 'overrideredirect', self.root._w, 0)
             self.root.title("GoldTracker  |  XAU/USD")
             self._menu.entryconfig(self._menu_taskbar_idx, label="切换到浮动模式")
         else:
-            self.root.overrideredirect(True)
+            self.root.tk.call('wm', 'overrideredirect', self.root._w, 1)
             self._menu.entryconfig(self._menu_taskbar_idx, label="切换到任务栏模式")
 
         self.root.geometry(f"+{x}+{y}")
