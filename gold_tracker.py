@@ -2,10 +2,11 @@
 GoldTracker - Real-time XAU/USD (Gold Price) Floating Monitor
 ==============================================================
 - Always-on-top borderless floating window
-- Data fetched every 1 second (free public API, no key required)
+- Data source: Deriv.com public WebSocket CFD feed (frxXAUUSD, no API key)
+- WebSocket delivers live Bid/Ask ticks in real-time (~1 tick/sec)
 - UI refreshed every 10 ms (smooth animations, flash on price change)
 - Collapse / Expand with double-click on drag handle
-- Right-click context menu: opacity / reset position / exit
+- Right-click menu: taskbar mode, opacity, reset position, exit
 - Drag handle at top for repositioning
 
 Usage:
@@ -15,12 +16,13 @@ Build to EXE:
     pip install pyinstaller
     pyinstaller --onefile --noconsole --name GoldTracker gold_tracker.py
 
-Primary API:  https://stooq.com  XAU/USD spot (CSV, no key)
-Fallback API: https://query2.finance.yahoo.com  GC=F futures (JSON, no key)
+CFD  API:  wss://ws.binaryws.com/websockets/v3  (Deriv public WS, frxXAUUSD)
+HTTP API:  https://stooq.com  XAU/USD spot CSV  (fallback when WS unavailable)
 """
 
 import tkinter as tk
 import threading
+import asyncio
 import urllib.request
 import json
 import ssl
@@ -28,9 +30,15 @@ import time
 import math
 from datetime import datetime
 
+try:
+    import websockets
+    _HAS_WEBSOCKETS = True
+except ImportError:
+    _HAS_WEBSOCKETS = False
+
 # ─── Timing ───────────────────────────────────────────────────────────────────
-REFRESH_DATA_SEC = 0.2     # fetch new price from network every N seconds
-REFRESH_UI_MS    = 10      # redraw UI every N milliseconds
+REFRESH_UI_MS    = 10      # UI redraw interval (ms)
+WS_RECONNECT_SEC = 3.0     # seconds to wait between WebSocket reconnects
 
 # ─── Window dimensions ────────────────────────────────────────────────────────
 WIN_W            = 230
@@ -72,106 +80,137 @@ class GoldPriceData:
 
 class GoldPriceService:
     """
-    Fetches live gold price from public APIs.
-    Tries primary (Stooq spot XAU/USD) first; on failure falls back to
-    Yahoo Finance GC=F futures.  Both require no API key.
+    Provides live XAU/USD CFD Bid/Ask via Deriv.com public WebSocket.
+    Runs a persistent subscription (frxXAUUSD) in a background asyncio loop.
+    Automatically reconnects on disconnect.
+    Falls back to Stooq HTTP as bootstrap price while WS is connecting.
+    No API key required.
     """
 
-    # Stooq: returns CSV with current spot XAU/USD price
-    _PRIMARY  = "https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv"
-    # Yahoo Finance: GC=F near-month gold futures
-    _FALLBACK = "https://query2.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1m&range=1d"
-
-    _HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept":     "*/*",
-    }
-
-    # SSL context that skips certificate verification (handles misconfigured endpoints)
+    # ── Deriv public WebSocket CFD feed (no auth required) ──────────────────
+    _WS_URL    = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+    _WS_SYMBOL = "frxXAUUSD"
+    # ── HTTP fallback (Stooq spot CSV) ───────────────────────────────────────
+    _HTTP_URL  = "https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv"
     _SSL_CTX = ssl.create_default_context()
     _SSL_CTX.check_hostname = False
     _SSL_CTX.verify_mode    = ssl.CERT_NONE
 
     def __init__(self):
-        self._last = GoldPriceData()
-
-    # ── Public ──────────────────────────────────────────────────────────────
-
-    def fetch(self) -> GoldPriceData:
-        """Return the latest GoldPriceData; falls back to cached on error."""
+        self._data       = GoldPriceData()   # latest snapshot (read by UI)
+        self._prev_close = 0.0               # previous day close for change calc
+        self._running    = True
+        self.tick_event  = threading.Event() # set on each new WS tick
+        # Bootstrap with HTTP so price shows immediately before WS connects
         try:
-            data = self._fetch_primary()
-        except Exception as e1:
+            self._data = self._http_fetch()
+            self._prev_close = self._data.bid
+        except Exception:
+            pass
+        # Start background WS thread
+        self._thread = threading.Thread(target=self._ws_thread_main, daemon=True)
+        self._thread.start()
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    @property
+    def data(self) -> GoldPriceData:
+        """Latest price snapshot — safe to read from any thread."""
+        return self._data
+
+    def stop(self):
+        self._running = False
+
+    # ── WebSocket thread (background asyncio loop) ───────────────────────────
+
+    def _ws_thread_main(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        while self._running:
             try:
-                data = self._fetch_fallback()
-            except Exception as e2:
-                data = self._make_error(str(e2))
+                loop.run_until_complete(self._ws_subscribe())
+            except Exception as e:
+                if self._running:
+                    d = GoldPriceData()
+                    d.connected = False
+                    d.error     = str(e)
+                    # Preserve last known price on reconnect
+                    if self._data.bid > 0:
+                        d.bid        = self._data.bid
+                        d.ask        = self._data.ask
+                        d.change     = self._data.change
+                        d.change_pct = self._data.change_pct
+                    self._data = d
+                    time.sleep(WS_RECONNECT_SEC)
+        loop.close()
 
-        # Always propagate last known price on connection failure
-        if not data.connected and self._last.bid > 0:
-            data.bid = self._last.bid
-            data.ask = self._last.ask
-            data.change     = self._last.change
-            data.change_pct = self._last.change_pct
+    async def _ws_subscribe(self):
+        async with websockets.connect(
+            self._WS_URL,
+            ping_interval=20,
+            ping_timeout=15,
+            close_timeout=5,
+        ) as ws:
+            # ── Request previous-day candle as baseline for change ──────────
+            await ws.send(json.dumps({
+                "ticks_history": self._WS_SYMBOL,
+                "end":           "latest",
+                "count":         2,
+                "granularity":   86400,
+                "style":         "candles",
+            }))
+            resp = json.loads(await ws.recv())
+            if resp.get("msg_type") == "candles":
+                candles = resp.get("candles", [])
+                if len(candles) >= 2:
+                    self._prev_close = float(candles[-2]["close"])
+                elif len(candles) == 1:
+                    self._prev_close = float(candles[0]["open"])
 
-        if data.bid > 0:
-            self._last = data
+            # ── Subscribe to live ticks ─────────────────────────────────────
+            await ws.send(json.dumps({
+                "ticks":     self._WS_SYMBOL,
+                "subscribe": 1,
+            }))
 
-        return data
+            async for raw in ws:
+                if not self._running:
+                    break
+                msg = json.loads(raw)
+                if msg.get("msg_type") != "tick":
+                    continue
+                tick = msg["tick"]
+                d = GoldPriceData()
+                d.bid       = float(tick["bid"])
+                d.ask       = float(tick["ask"])
+                d.timestamp = datetime.fromtimestamp(int(tick["epoch"]))
+                d.connected = True
+                d.source    = "Deriv CFD"
+                if self._prev_close > 0:
+                    d.change     = d.bid - self._prev_close
+                    d.change_pct = d.change / self._prev_close * 100.0
+                self._data = d
+                self.tick_event.set()
 
-    # ── Private ─────────────────────────────────────────────────────────────
+    # ── HTTP bootstrap (Stooq spot CSV) ──────────────────────────────────────
 
-    def _fetch_primary(self) -> GoldPriceData:
-        # Stooq CSV response (header + data row):
-        # Symbol,Date,Time,Open,High,Low,Close,Volume
-        # XAUUSD,2026-03-05,09:09:12,5146.785,5194.895,5123.225,5154.245,
-        req = urllib.request.Request(self._PRIMARY, headers=self._HEADERS)
-        with urllib.request.urlopen(req, timeout=8, context=self._SSL_CTX) as resp:
-            raw = resp.read().decode("utf-8").strip()
-        lines = raw.splitlines()
-        if len(lines) < 2:
-            raise ValueError(f"Unexpected Stooq response: {raw[:80]}")
-        parts = lines[1].split(",")
-        # parts: Symbol, Date, Time, Open, High, Low, Close, Volume
-        price_close = float(parts[6])
-        price_open  = float(parts[3])
-        chg  = price_close - price_open
-        pct  = (chg / price_open * 100.0) if price_open else 0.0
+    def _http_fetch(self) -> GoldPriceData:
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+        req = urllib.request.Request(self._HTTP_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=8, context=self._SSL_CTX) as r:
+            raw = r.read().decode("utf-8").strip()
+        parts = raw.splitlines()[1].split(",")
+        close = float(parts[6])
+        open_ = float(parts[3])
+        chg   = close - open_
         d = GoldPriceData()
-        d.bid        = price_close
-        d.ask        = price_close
+        d.bid        = close
+        d.ask        = close
         d.change     = chg
-        d.change_pct = pct
+        d.change_pct = (chg / open_ * 100.0) if open_ else 0.0
         d.timestamp  = datetime.now()
         d.connected  = True
-        d.source     = "Stooq spot"
-        return d
-
-    def _fetch_fallback(self) -> GoldPriceData:
-        # Yahoo Finance JSON for GC=F futures
-        req = urllib.request.Request(self._FALLBACK, headers=self._HEADERS)
-        with urllib.request.urlopen(req, timeout=8, context=self._SSL_CTX) as resp:
-            raw = resp.read().decode("utf-8")
-        j    = json.loads(raw)
-        meta = j["chart"]["result"][0]["meta"]
-        price = float(meta.get("regularMarketPrice") or 0)
-        prev  = float(meta.get("chartPreviousClose") or price or 1)
-        chg   = price - prev
-        d = GoldPriceData()
-        d.bid        = price
-        d.ask        = price
-        d.change     = chg
-        d.change_pct = (chg / prev * 100.0) if prev else 0.0
-        d.timestamp  = datetime.now()
-        d.connected  = True
-        d.source     = "Yahoo GC=F"
-        return d
-
-    @staticmethod
-    def _make_error(msg: str) -> GoldPriceData:
-        d = GoldPriceData()
-        d.connected = False
-        d.error     = msg
+        d.source     = "Stooq (init)"
         return d
 
 
@@ -205,7 +244,7 @@ class GoldTrackerApp:
         self._configure_window()
         self._build_ui()
 
-        # ── Background thread: network fetch ──
+        # ── Background thread: tick listener ──
         t = threading.Thread(target=self._fetch_loop, daemon=True)
         t.start()
 
@@ -417,23 +456,21 @@ class GoldTrackerApp:
     # ──────────────────────────── Background fetch ───────────────────────────
 
     def _fetch_loop(self):
-        """Runs in daemon thread; fetches price every REFRESH_DATA_SEC seconds."""
+        """Waits for WS ticks from GoldPriceService; drives flash animation on change."""
         while self._running:
-            self._fetching = True
-            try:
-                new_data = self.service.fetch()
-                # Detect price change
-                new_price = new_data.bid if new_data.bid > 0 else new_data.ask
-                if new_price > 0 and new_price != self._prev_price:
-                    self._flash_up    = new_price > self._prev_price
-                    self._flash_alpha = 1.0
-                    self._prev_price  = new_price
-                self.data = new_data
-            except Exception:
-                pass
-            finally:
-                self._fetching = False
-            time.sleep(REFRESH_DATA_SEC)
+            got_tick = self.service.tick_event.wait(timeout=0.5)
+            if not self._running:
+                break
+            if got_tick:
+                self.service.tick_event.clear()
+            self._fetching = got_tick
+            new_data  = self.service.data
+            new_price = new_data.bid if new_data.bid > 0 else new_data.ask
+            if new_price > 0 and new_price != self._prev_price:
+                self._flash_up    = new_price > self._prev_price
+                self._flash_alpha = 1.0
+                self._prev_price  = new_price
+            self.data = new_data
 
     # ──────────────────────────── UI refresh (10 ms) ─────────────────────────
 
@@ -508,6 +545,7 @@ class GoldTrackerApp:
 
     def _quit(self):
         self._running = False
+        self.service.stop()
         self.root.destroy()
 
     def run(self):
